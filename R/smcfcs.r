@@ -794,6 +794,7 @@ smcfcs.core <- function(originaldata,smtype,smformula,method,predictorMatrix=NUL
           }
 
           outcomeDensCovDens = array(dim=c(length(imputationNeeded),numberOutcomes),0)
+          outcomeLogDensCovLogDens = array(dim=c(length(imputationNeeded),numberOutcomes),-1 * Inf)
 
           for (xMisVal in 1:numberOutcomes) {
             if (method[targetCol]=="logreg") {
@@ -837,9 +838,12 @@ smcfcs.core <- function(originaldata,smtype,smformula,method,predictorMatrix=NUL
                 d[imputationNeeded]*(survival::dsurvreg(imputations[[imp]][imputationNeeded,timeCol], mean=outmodxb[imputationNeeded], scale=weibullScale))
             }
             else if ((smtype=="coxph") | (smtype=="casecohort")) {
-              outmodxb <-  model.matrix(as.formula(smformula),imputations[[imp]])
+              # filter out terms related to "strata" as these do not enter the linear predictor
+              smformula_matrix <- filter_strata(smformula)
+              outmodxb <-  model.matrix(as.formula(smformula_matrix),imputations[[imp]])
               outmodxb <- as.matrix(outmodxb[,2:dim(outmodxb)[2]]) %*% as.matrix(outcomeModBeta)
               outcomeDens <- exp(-H0[imputationNeeded] * exp(outmodxb[imputationNeeded]))* (exp(outmodxb[imputationNeeded])^d[imputationNeeded])
+              outcomeLogDens <- -H0[imputationNeeded] * exp(outmodxb[imputationNeeded]) + d[imputationNeeded] * outmodxb[imputationNeeded]
             }
             else if (smtype=="nestedcc") {
               outmodxb <-  model.matrix(as.formula(smformula2),imputations[[imp]])
@@ -855,8 +859,17 @@ smcfcs.core <- function(originaldata,smtype,smformula,method,predictorMatrix=NUL
               }
             }
             outcomeDensCovDens[,xMisVal] <- outcomeDens * fittedMean[imputationNeeded,xMisVal]
+            if (smtype=='coxph') outcomeLogDensCovLogDens[,xMisVal] <- outcomeLogDens + log(fittedMean[imputationNeeded,xMisVal])
           }
-          directImpProbs = outcomeDensCovDens / rowSums(outcomeDensCovDens)
+          if (smtype=='coxph') {
+            directImpLogProbs = outcomeLogDensCovLogDens - (matrixStats::rowLogSumExps(outcomeDensCovDens) - log(dim(outcomeDensCovDens)[2]))
+            directImpProbs = exp(directImpLogProbs)
+          } else {
+            directImpProbs = outcomeDensCovDens / rowSums(outcomeDensCovDens)
+          }
+          ### add another one to prevent underflow
+          ### this adds a tiny bias towards the mean for each probability
+          directImpProbs = (1e-10 + directImpProbs) / (1 + dim(outcomeDensCovDens)[2] * 1e-10)
 
           if (method[targetCol]=="logreg") {
             directImpProbs = directImpProbs[,2]
@@ -869,6 +882,9 @@ smcfcs.core <- function(originaldata,smtype,smformula,method,predictorMatrix=NUL
             }
           }
           else {
+            if (anyNA(directImpProbs) | any(directImpProbs <= 0) | any(directImpProbs >= 1)) {
+              print(targetCol)
+            }
             imputations[[imp]][imputationNeeded,targetCol] <- levels(imputations[[imp]][,targetCol])[apply(directImpProbs, 1, catdraw)]
           }
 
@@ -922,7 +938,9 @@ smcfcs.core <- function(originaldata,smtype,smformula,method,predictorMatrix=NUL
               prob <- d[imputationNeeded]*prob + (1-d[imputationNeeded])*s_t
               reject <- 1*(uDraw>prob)
             } else if ((smtype=="coxph") | (smtype=="casecohort")) {
-              outmodxb <-  model.matrix(as.formula(smformula),imputations[[imp]])
+              # filter out terms related to "strata" as these do not enter the linear predictor
+              smformula_matrix <- filter_strata(smformula)
+              outmodxb <-  model.matrix(as.formula(smformula_matrix),imputations[[imp]])
               outmodxb <- as.matrix(outmodxb[,2:dim(outmodxb)[2]]) %*% as.matrix(outcomeModBeta)
               s_t = exp(-H0[imputationNeeded]* exp(outmodxb[imputationNeeded]))
               prob = exp(1 + outmodxb[imputationNeeded] - (H0[imputationNeeded]* exp(outmodxb[imputationNeeded])) ) * H0[imputationNeeded]
@@ -1008,7 +1026,9 @@ smcfcs.core <- function(originaldata,smtype,smformula,method,predictorMatrix=NUL
               reject = 1*(uDraw>prob)
             }
             else if ((smtype=="coxph") | (smtype=="casecohort")) {
-              outmodxb <-  model.matrix(as.formula(smformula),tempData)
+              # filter out terms related to "strata" as these do not enter the linear predictor
+              smformula_matrix <- filter_strata(smformula)
+              outmodxb <-  model.matrix(as.formula(smformula_matrix),tempData)
               outmodxb <- as.matrix(outmodxb[,2:dim(outmodxb)[2]]) %*% as.matrix(outcomeModBeta)
               s_t = exp(-H0[i]* exp(outmodxb))
               prob = exp(1 + outmodxb - (H0[i]* exp(outmodxb)) ) * H0[i]
@@ -1161,4 +1181,21 @@ dtsamOutcomeDens <- function(inputData,timeEffects,outcomeModBeta,nTimePoints,sm
   #return vector of outcome density values
   exp(logSurvProbIndividual + inputData[,dCol]*log(prob[cbind(1:inputDataN, inputData[,timeCol])]))
 
+}
+
+filter_strata <- function(smformula) {
+  rhs <- gsub(x = smformula, pattern = ".*~", replacement = "")
+
+  smformula_matrix <- as.formula(paste0("~ +", rhs))
+
+  # Check if there is stratification - if so remove from model matrix
+  # (stratification means different baseline hazards, coefficients still same)
+  if (grepl(x = rhs, pattern = "strata")) {
+    strata_var <- stringr::str_replace_all(rhs, pattern = ".*\\(|\\).*", replacement = "")
+    # strata_var <- gsub(x = rhs, pattern = ".*\\(|\\).*", replacement = "")
+    rm_strata <- as.formula(paste0("~ . - strata(", strata_var, ")"))
+    smformula_matrix <- update(smformula_matrix, rm_strata)
+  }
+
+  return(smformula_matrix)
 }
